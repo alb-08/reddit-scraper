@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import datetime
 import json
+import re
 import sqlite3
 import sys
 import time
@@ -367,6 +368,45 @@ def search_topic(conn: sqlite3.Connection, topic: str, subreddits: list[str],
     return found
 
 
+def harvest_comments(conn: sqlite3.Connection, topic: str | None, limit: int,
+                     min_comments: int, technical_only: bool) -> None:
+    """Fetch comment trees for the most discussion-heavy stored posts.
+
+    Ranks candidates by comments-per-upvote: a post with many comments and
+    few votes is an argument or a deep technical thread, while the reverse
+    is usually a meme everyone upvoted and nobody discussed.
+    """
+    where = ["p.num_comments >= ?"]
+    params: list[Any] = [min_comments]
+    if topic:
+        where.append("p.id IN (SELECT post_id FROM post_topics WHERE topic = ?)")
+        params.append(topic)
+    if technical_only:
+        where.append("p.subreddit IN ('LocalLLaMA','ExperiencedDevs','programming')")
+    params.append(limit)
+
+    rows = conn.execute(
+        f"""SELECT p.id, p.title, p.num_comments, p.subreddit
+            FROM posts p
+            WHERE {' AND '.join(where)}
+              AND 't3_' || p.id NOT IN (SELECT link_id FROM fetched_threads)
+            ORDER BY (CAST(p.num_comments AS REAL) / (p.score + 10)) DESC
+            LIMIT ?""",
+        params,
+    ).fetchall()
+
+    if not rows:
+        print("no unfetched posts match; widen --min-comments or run `search` first")
+        return
+    print(f"harvesting {len(rows)} discussion-heavy threads\n")
+    for i, (pid, title, ncom, sr) in enumerate(rows, 1):
+        print(f"[{i}/{len(rows)}] r/{sr} ({ncom}c) {title[:52]}")
+        try:
+            scrape_thread(conn, pid)
+        except (RuntimeError, urllib.error.HTTPError, urllib.error.URLError) as e:
+            print(f"  FAILED ({e})", file=sys.stderr)
+
+
 def rank_posts(conn: sqlite3.Connection, topic: str | None, limit: int,
                include_immature: bool) -> list[sqlite3.Row]:
     """Rank stored posts by engagement (score + comments)."""
@@ -402,6 +442,86 @@ def topic_summary(conn: sqlite3.Connection, include_immature: bool) -> list[sqli
             WHERE 1=1 {clause}
             GROUP BY t.topic ORDER BY total_score DESC"""
     ).fetchall()
+
+
+# Niche knowledge tends to look a certain way: concrete numbers, CLI flags,
+# env vars, versions, file paths, code. Jokes and reaction comments don't.
+TECHNICAL = re.compile(
+    r"--[a-z][\w-]+"                      # CLI flags
+    r"|\b[A-Z][A-Z_]{3,}\b"               # ENV_VARS / constants
+    r"|`[^`]+`"                           # inline code
+    r"|\b\d+(?:\.\d+)?\s?(?:k|m|b|gb|mb|ms|s|x|%|tok|tokens?|/s)\b"  # measurements
+    r"|\bv?\d+\.\d+(?:\.\d+)?\b"          # versions
+    r"|\.(?:py|js|ts|json|toml|yaml|yml|sh|md)\b"  # filenames
+    r"|https?://",
+    re.I,
+)
+# First-hand experience beats speculation.
+EXPERIENCE = re.compile(
+    r"\bI(?:'ve)?\s+(?:tried|tested|ran|run|found|switched|built|used|use|noticed|"
+    r"measured|benchmark\w*|compared|migrated|deployed|spent|hit|discovered)\b",
+    re.I,
+)
+HEDGE = re.compile(r"\b(?:probably|i think|maybe|imo|guess|might be)\b", re.I)
+
+
+def signal_score(comment: dict) -> float:
+    """Heuristic for how much concrete knowledge a comment carries.
+
+    Deliberately not upvote-driven: the aim is buried specifics, which the
+    vote count tends to ignore. Community score is a weak positive only, so
+    a well-argued reply five levels deep can outrank a top-level one-liner.
+    """
+    body = (comment.get("body") or "").strip()
+    if not body or body in ("[deleted]", "[removed]"):
+        return 0.0
+
+    words = len(body.split())
+    if words < 25:            # quips and reactions
+        return 0.0
+    if words > 900:           # pasted articles / model dumps
+        return 0.0
+
+    score = 0.0
+    score += min(len(TECHNICAL.findall(body)), 12) * 3.0
+    score += min(len(EXPERIENCE.findall(body)), 4) * 6.0
+    score += min(words / 50, 6.0)                    # substance, capped
+    score += min(max(comment.get("score", 0), 0) ** 0.5, 8.0)   # weak vote signal
+    score += min(comment.get("depth", 0), 4) * 1.5   # buried replies are the point
+    score -= min(len(HEDGE.findall(body)), 4) * 2.0  # speculation
+    return score
+
+
+def mine_insights(conn: sqlite3.Connection, topic: str | None, limit: int,
+                  min_words: int) -> list[tuple[float, dict]]:
+    """Rank stored comments by concrete-knowledge signal rather than votes."""
+    where, params = ["1=1"], []
+    if topic:
+        where.append(
+            "c.link_id IN (SELECT 't3_' || post_id FROM post_topics WHERE topic = ?)"
+        )
+        params.append(topic)
+    rows = conn.execute(
+        f"""SELECT c.id, c.body, c.score, c.author, c.subreddit, c.permalink,
+                   c.raw, p.title
+            FROM comments c
+            LEFT JOIN posts p ON p.id = SUBSTR(c.link_id, 4)
+            WHERE {' AND '.join(where)}""",
+        params,
+    ).fetchall()
+
+    scored = []
+    for r in rows:
+        raw = json.loads(r[6])
+        raw["score"] = r[2]
+        if len((r[1] or "").split()) < min_words:
+            continue
+        s = signal_score(raw)
+        if s > 0:
+            scored.append((s, {"id": r[0], "body": r[1], "score": r[2], "author": r[3],
+                               "subreddit": r[4], "permalink": r[5], "post": r[7]}))
+    scored.sort(key=lambda x: -x[0])
+    return scored[:limit]
 
 
 def build_tree(conn: sqlite3.Connection, post_id: str) -> list[dict]:
@@ -466,6 +586,19 @@ def main() -> int:
     p_search.add_argument("--loose", action="store_true",
                           help="keep word-matches instead of exact-phrase only")
 
+    p_harv = sub.add_parser("harvest", help="fetch comment trees for discussion-heavy posts")
+    p_harv.add_argument("--topic")
+    p_harv.add_argument("--limit", type=int, default=40)
+    p_harv.add_argument("--min-comments", type=int, default=15)
+    p_harv.add_argument("--technical-only", action="store_true",
+                        help="restrict to LocalLLaMA / ExperiencedDevs / programming")
+
+    p_mine = sub.add_parser("insights", help="surface concrete details buried in comments")
+    p_mine.add_argument("--topic")
+    p_mine.add_argument("--limit", type=int, default=20)
+    p_mine.add_argument("--min-words", type=int, default=30)
+    p_mine.add_argument("--full", action="store_true", help="print whole comment bodies")
+
     p_rank = sub.add_parser("rank", help="rank stored posts by upvotes and comments")
     p_rank.add_argument("--topic", help="restrict to one topic")
     p_rank.add_argument("--limit", type=int, default=25)
@@ -500,6 +633,22 @@ def main() -> int:
                 total += search_topic(conn, topic, subs, args.after, args.before,
                                       max_per_sub=args.max_per_sub, exact=not args.loose)
             print(f"\nstored {total} post matches -> {DB_PATH}")
+        elif args.cmd == "harvest":
+            harvest_comments(conn, args.topic, args.limit, args.min_comments,
+                             args.technical_only)
+        elif args.cmd == "insights":
+            hits = mine_insights(conn, args.topic, args.limit, args.min_words)
+            if not hits:
+                print("nothing found; run `harvest` first to fetch comment trees")
+                return 1
+            for i, (s, c) in enumerate(hits, 1):
+                body = " ".join((c["body"] or "").split())
+                if not args.full and len(body) > 420:
+                    body = body[:420] + "..."
+                print(f"\n{i}. [signal {s:.0f} | {c['score']}up] r/{c['subreddit']} — u/{c['author']}")
+                print(f"   on: {(c['post'] or '?')[:70]}")
+                print(f"   {body}")
+                print(f"   https://reddit.com{c['permalink']}")
         elif args.cmd == "rank":
             if args.compare:
                 rows = topic_summary(conn, args.include_immature)
