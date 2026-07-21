@@ -15,6 +15,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import datetime
 import json
 import sqlite3
 import sys
@@ -62,7 +63,19 @@ CREATE TABLE IF NOT EXISTS fetched_threads (
     comment_count INTEGER,
     fetched_at    INTEGER
 );
+CREATE TABLE IF NOT EXISTS post_topics (
+    post_id       TEXT NOT NULL,
+    topic         TEXT NOT NULL,
+    PRIMARY KEY (post_id, topic)
+);
+CREATE INDEX IF NOT EXISTS idx_post_topics_topic ON post_topics(topic);
 """
+
+# The archive captures a post seconds after it is created (score ~1), then
+# re-captures it roughly a day and a half later once voting has settled. Only
+# that second capture carries a trustworthy score, so ranking must not treat
+# an un-recaptured post's score as real.
+SCORE_MATURITY_SECONDS = 36 * 3600
 
 
 class RateLimiter:
@@ -133,7 +146,7 @@ def get(path: str, params: dict[str, Any], retries: int = 5) -> list[dict]:
     raise RuntimeError(f"giving up on {url} after {retries} attempts")
 
 
-def paginate(path: str, params: dict[str, Any]) -> Iterator[dict]:
+def paginate(path: str, params: dict[str, Any], max_records: int | None = None) -> Iterator[dict]:
     """Yield every record for a query, ascending by created_utc.
 
     The API sorts descending by default and treats `after` as exclusive, so a
@@ -157,6 +170,8 @@ def paginate(path: str, params: dict[str, Any]) -> Iterator[dict]:
         for record in fresh:
             seen.add(record["id"])
             yield record
+            if max_records is not None and len(seen) >= max_records:
+                return
 
         if len(page) < PAGE_LIMIT:
             return
@@ -179,7 +194,25 @@ def paginate(path: str, params: dict[str, Any]) -> Iterator[dict]:
 def db_connect(path: Path = DB_PATH) -> sqlite3.Connection:
     conn = sqlite3.connect(path)
     conn.executescript(SCHEMA)
+    # Added after the first release; older databases predate it.
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(posts)")}
+    if "score_mature" not in cols:
+        conn.execute("ALTER TABLE posts ADD COLUMN score_mature INTEGER DEFAULT 0")
+        conn.commit()
     return conn
+
+
+def score_is_mature(post: dict) -> bool:
+    """True when the archive re-captured this post after voting settled.
+
+    Falls back to post age when no second-capture timestamp is present, so a
+    post old enough to have settled still counts even if the metadata is thin.
+    """
+    second = (post.get("_meta") or {}).get("retrieved_2nd_on")
+    created = post.get("created_utc") or 0
+    if second and created:
+        return (second - created) >= SCORE_MATURITY_SECONDS
+    return (time.time() - created) >= SCORE_MATURITY_SECONDS if created else False
 
 
 def save_comments(conn: sqlite3.Connection, rows: list[dict]) -> None:
@@ -212,12 +245,12 @@ def save_comments(conn: sqlite3.Connection, rows: list[dict]) -> None:
 def save_posts(conn: sqlite3.Connection, rows: list[dict]) -> None:
     conn.executemany(
         """INSERT INTO posts (id, subreddit, title, author, created_utc, score,
-                              num_comments, permalink, selftext, raw)
+                              num_comments, permalink, selftext, raw, score_mature)
            VALUES (:id, :subreddit, :title, :author, :created_utc, :score,
-                   :num_comments, :permalink, :selftext, :raw)
+                   :num_comments, :permalink, :selftext, :raw, :score_mature)
            ON CONFLICT(id) DO UPDATE SET
                score = excluded.score, num_comments = excluded.num_comments,
-               raw = excluded.raw""",
+               raw = excluded.raw, score_mature = excluded.score_mature""",
         [
             {
                 "id": p["id"],
@@ -230,6 +263,7 @@ def save_posts(conn: sqlite3.Connection, rows: list[dict]) -> None:
                 "permalink": p.get("permalink"),
                 "selftext": p.get("selftext"),
                 "raw": json.dumps(p, separators=(",", ":")),
+                "score_mature": int(score_is_mature(p)),
             }
             for p in rows
         ],
@@ -294,6 +328,82 @@ def scrape_subreddit(conn: sqlite3.Connection, name: str, after: str, before: st
         print(f"{len(failed)} failed, rerun to retry: {' '.join(failed)}", file=sys.stderr)
 
 
+def search_topic(conn: sqlite3.Connection, topic: str, subreddits: list[str],
+                 after: str, before: str, max_per_sub: int = 300,
+                 exact: bool = True) -> int:
+    """Search each subreddit for `topic` and store the matches tagged with it.
+
+    Full-text search is per-subreddit, so a cross-community view means one
+    query per subreddit and merging the results.
+
+    The API matches all query *words* rather than the phrase, so "claude code"
+    also returns posts merely containing both words. With `exact`, results are
+    filtered down to those actually containing the phrase.
+    """
+    found = 0
+    needle = topic.lower()
+    for sr in subreddits:
+        try:
+            posts = list(paginate("posts/search",
+                                  {"subreddit": sr, "query": topic,
+                                   "after": after, "before": before},
+                                  max_records=max_per_sub))
+        except (RuntimeError, urllib.error.HTTPError, urllib.error.URLError) as e:
+            print(f"  r/{sr}: FAILED ({e})", file=sys.stderr)
+            continue
+        if exact:
+            posts = [p for p in posts
+                     if needle in (f"{p.get('title', '')} "
+                                   f"{p.get('selftext') or ''}").lower()]
+        if posts:
+            save_posts(conn, posts)
+            conn.executemany(
+                "INSERT OR IGNORE INTO post_topics (post_id, topic) VALUES (?, ?)",
+                [(p["id"], topic) for p in posts],
+            )
+            conn.commit()
+        found += len(posts)
+        print(f"  r/{sr}: {len(posts)}")
+    return found
+
+
+def rank_posts(conn: sqlite3.Connection, topic: str | None, limit: int,
+               include_immature: bool) -> list[sqlite3.Row]:
+    """Rank stored posts by engagement (score + comments)."""
+    where, params = ["1=1"], []
+    if topic:
+        where.append("p.id IN (SELECT post_id FROM post_topics WHERE topic = ?)")
+        params.append(topic)
+    if not include_immature:
+        where.append("p.score_mature = 1")
+    params.append(limit)
+    return conn.execute(
+        f"""SELECT p.id, p.subreddit, p.title, p.score, p.num_comments,
+                   p.created_utc, p.permalink, p.score_mature,
+                   (SELECT GROUP_CONCAT(topic) FROM post_topics WHERE post_id = p.id) topics
+            FROM posts p WHERE {' AND '.join(where)}
+            ORDER BY (p.score + p.num_comments * 2) DESC
+            LIMIT ?""",
+        params,
+    ).fetchall()
+
+
+def topic_summary(conn: sqlite3.Connection, include_immature: bool) -> list[sqlite3.Row]:
+    """Aggregate engagement per topic, for comparing tools against each other."""
+    clause = "" if include_immature else "AND p.score_mature = 1"
+    return conn.execute(
+        f"""SELECT t.topic,
+                   COUNT(*) posts,
+                   SUM(p.score) total_score,
+                   SUM(p.num_comments) total_comments,
+                   CAST(AVG(p.score) AS INT) avg_score,
+                   MAX(p.score) top_score
+            FROM post_topics t JOIN posts p ON p.id = t.post_id
+            WHERE 1=1 {clause}
+            GROUP BY t.topic ORDER BY total_score DESC"""
+    ).fetchall()
+
+
 def build_tree(conn: sqlite3.Connection, post_id: str) -> list[dict]:
     """Rebuild the nested comment tree for a post from stored parent_id links."""
     link_id = post_id if post_id.startswith("t3_") else f"t3_{post_id}"
@@ -346,7 +456,28 @@ def main() -> int:
     p_tree = sub.add_parser("tree", help="print a stored thread as a nested tree")
     p_tree.add_argument("post_id")
 
+    p_search = sub.add_parser("search", help="search topics across subreddits and tag them")
+    p_search.add_argument("--topics", required=True, help="comma-separated search terms")
+    p_search.add_argument("--subreddits", required=True, help="comma-separated subreddits")
+    p_search.add_argument("--after", required=True, help="YYYY-MM-DD")
+    p_search.add_argument("--before", required=True, help="YYYY-MM-DD")
+    p_search.add_argument("--max-per-sub", type=int, default=300,
+                          help="cap results fetched per subreddit (default 300)")
+    p_search.add_argument("--loose", action="store_true",
+                          help="keep word-matches instead of exact-phrase only")
+
+    p_rank = sub.add_parser("rank", help="rank stored posts by upvotes and comments")
+    p_rank.add_argument("--topic", help="restrict to one topic")
+    p_rank.add_argument("--limit", type=int, default=25)
+    p_rank.add_argument("--compare", action="store_true", help="per-topic totals")
+    p_rank.add_argument("--include-immature", action="store_true",
+                        help="include posts whose score has not settled yet")
+
     args = ap.parse_args()
+    # Long crawls are usually piped or backgrounded; without this, progress
+    # sits in a block buffer and the run looks hung. UTF-8 with replacement
+    # keeps emoji-laden Reddit titles from killing the run on a cp1252 console.
+    sys.stdout.reconfigure(line_buffering=True, encoding="utf-8", errors="replace")
     conn = db_connect()
     try:
         if args.cmd == "post":
@@ -361,6 +492,32 @@ def main() -> int:
                 print("nothing stored for that post; run `post` first")
                 return 1
             print_tree(tree)
+        elif args.cmd == "search":
+            subs = [s.strip() for s in args.subreddits.split(",") if s.strip()]
+            total = 0
+            for topic in [t.strip() for t in args.topics.split(",") if t.strip()]:
+                print(f"\n=== {topic!r} ===")
+                total += search_topic(conn, topic, subs, args.after, args.before,
+                                      max_per_sub=args.max_per_sub, exact=not args.loose)
+            print(f"\nstored {total} post matches -> {DB_PATH}")
+        elif args.cmd == "rank":
+            if args.compare:
+                rows = topic_summary(conn, args.include_immature)
+                print(f"{'topic':<20}{'posts':>7}{'score':>9}{'comments':>10}{'avg':>7}{'top':>8}")
+                print("-" * 61)
+                for r in rows:
+                    print(f"{r[0]:<20}{r[1]:>7}{r[2] or 0:>9}{r[3] or 0:>10}{r[4] or 0:>7}{r[5] or 0:>8}")
+                return 0
+            rows = rank_posts(conn, args.topic, args.limit, args.include_immature)
+            if not rows:
+                print("nothing stored; run `search` first")
+                return 1
+            for i, r in enumerate(rows, 1):
+                when = datetime.datetime.fromtimestamp(r[5], datetime.UTC).strftime("%Y-%m-%d")
+                flag = "" if r[7] else "  [score not settled]"
+                print(f"{i:>3}. [{r[3]:>5} up | {r[4]:>4} comments] r/{r[1]}  {when}{flag}")
+                print(f"     {r[2][:96]}")
+                print(f"     https://reddit.com{r[6]}")
     except KeyboardInterrupt:
         print("\ninterrupted; progress is saved, rerun to resume", file=sys.stderr)
         return 130
