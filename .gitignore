@@ -1,3 +1,6 @@
 # Scraped data — regenerate with reddit_scraper.py rather than committing
 reddit.db
 __pycache__/
+
+# Generated digests
+digests/
