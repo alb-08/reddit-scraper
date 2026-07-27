@@ -111,6 +111,16 @@ def write_digest(conn, after: str, before: str) -> Path:
 
 def main() -> int:
     sys.stdout.reconfigure(line_buffering=True, encoding="utf-8", errors="replace")
+
+    # Runs from both a fixed-time trigger and an at-logon trigger, so it may
+    # fire several times a day. Skip if today's digest already exists, unless
+    # --force. This makes an at-logon trigger safe: the first launch of the day
+    # produces the digest, later ones exit immediately.
+    today_file = Path(__file__).parent / "digests" / f"{datetime.date.today().isoformat()}.md"
+    if today_file.exists() and "--force" not in sys.argv:
+        print(f"today's digest already exists ({today_file.name}); skipping")
+        return 0
+
     after, before = daterange()
     conn = rs.db_connect()
     try:
